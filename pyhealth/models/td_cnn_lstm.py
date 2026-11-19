@@ -287,6 +287,13 @@ class TDCNNLSTM(BaseModel):
         next_measurements_key: Field holding the next-state observation.
         terminal_key: Field holding the terminal flag.
         terminal_reward_key: Field holding the terminal reward.
+        label_horizon_index: If set, the label used for training, ``y_true``
+            and model selection is column ``label_horizon_index`` of
+            ``horizons_key`` instead of the binary label field, so one sample
+            cache serves supervised baselines at every horizon. Defaults to
+            ``None``.
+        horizons_key: Field holding the multi-horizon labels. Defaults to
+            ``"mortality_horizons"``.
         normalization_samples: Number of samples used to compute the
             statistics. Defaults to 5000.
         clip_quantiles: Per-feature value quantiles used for clipping.
@@ -333,6 +340,8 @@ class TDCNNLSTM(BaseModel):
         next_measurements_key: str = "next_measurements",
         terminal_key: str = "terminal",
         terminal_reward_key: str = "terminal_reward",
+        label_horizon_index: Optional[int] = None,
+        horizons_key: str = "mortality_horizons",
         normalization_samples: int = 5000,
         clip_quantiles: Tuple[float, float] = (0.001, 0.999),
         seed: int = 0,
@@ -355,6 +364,8 @@ class TDCNNLSTM(BaseModel):
         self.next_measurements_key = next_measurements_key
         self.terminal_key = terminal_key
         self.terminal_reward_key = terminal_reward_key
+        self.label_horizon_index = label_horizon_index
+        self.horizons_key = horizons_key
         self.label_key = next(iter(self.label_processors), None)
         if self.label_key is None:
             raise ValueError("TDCNNLSTM needs a binary label in output_schema")
@@ -413,7 +424,10 @@ class TDCNNLSTM(BaseModel):
             sample = dataset[int(i)]
             x = torch.as_tensor(sample[self.measurements_key]).reshape(-1, 5)
             rows.append(x[x[:, FEATURE] > 0].numpy())
-            if self.label_key in sample:
+            if self.label_horizon_index is not None and self.horizons_key in sample:
+                horizons = torch.as_tensor(sample[self.horizons_key]).reshape(-1)
+                labels.append(float(horizons[self.label_horizon_index]))
+            elif self.label_key in sample:
                 labels.append(
                     float(torch.as_tensor(sample[self.label_key]).reshape(-1)[0])
                 )
@@ -571,7 +585,11 @@ class TDCNNLSTM(BaseModel):
 
         logit = self.encoder(*self.standardize(kwargs[self.measurements_key]))
         logit = logit.unsqueeze(-1)
-        y_true = kwargs[self.label_key].to(self.device).float().reshape(-1, 1)
+        if self.label_horizon_index is not None:
+            horizons = kwargs[self.horizons_key].to(self.device).float()
+            y_true = horizons[:, self.label_horizon_index].reshape(-1, 1)
+        else:
+            y_true = kwargs[self.label_key].to(self.device).float().reshape(-1, 1)
 
         if self.training_target == "td":
             target = self.td_target(kwargs).reshape(-1, 1)

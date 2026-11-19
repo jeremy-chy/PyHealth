@@ -169,6 +169,14 @@ class TestTDCNNLSTM(unittest.TestCase):
         )
         torch.testing.assert_close(out["loss"], expected)
 
+    def test_label_from_horizon_column(self):
+        model = self._model(training_target="supervised", label_horizon_index=2)
+        torch.testing.assert_close(model.class_weights, torch.tensor([0.5, 0.5]))
+        batch = _batch(self.dataset)
+        out = model(**batch)
+        expected = batch["mortality_horizons"][:, 2:3].float()
+        torch.testing.assert_close(out["y_true"], expected)
+
     def test_padding_invariance(self):
         model = self._model()
         model.eval()

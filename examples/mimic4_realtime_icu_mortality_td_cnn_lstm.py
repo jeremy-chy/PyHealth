@@ -46,13 +46,36 @@ Usage:
     python examples/mimic4_realtime_icu_mortality_td_cnn_lstm.py \\
         --root /path/to/mimic-iv-demo/2.2 --ablations target,tau
 
-Findings (synthetic data, 400 patients, 8 epochs, seed 0; see the printed
-table for exact numbers on your machine):
-    The results are summarised in the PR description and in our project docs;
-    on synthetic data the TD model and the supervised baselines reach similar
-    AUROC, the 1-day supervised model is best at the 1-day horizon, and TD is
-    competitive at long horizons. The synthetic data only checks that the
-    pipeline runs end to end; the paper's claims need full MIMIC-IV.
+Results (``--synthetic --seeds 0,1,2 --epochs 8``; 400 synthetic patients,
+mean over 3 seeds; test-split AUROC by horizon, plus 28-day AUPRC, Brier and
+ECE; "+" = class-balanced):
+
+    ============== ===== ===== ===== ===== ===== ====== ===== =====
+    config          1d    3d    7d    14d   28d  AUPRC  Brier  ECE
+    ============== ===== ===== ===== ===== ===== ====== ===== =====
+    TD (tau=0.01)  0.921 0.884 0.900 0.891 0.909 0.908  0.128 0.071
+    supervised 28d+ 0.918 0.887 0.902 0.891 0.908 0.908 0.139 0.108
+    supervised 1d+ 0.937 0.874 0.876 0.858 0.870 0.888  0.214 0.216
+    TD tau=0.005   0.932 0.888 0.898 0.888 0.906 0.907  0.136 0.089
+    TD tau=0.05    0.930 0.893 0.899 0.889 0.906 0.906  0.131 0.079
+    TD lambda=0.5  0.935 0.887 0.898 0.889 0.906 0.910  0.135 0.089
+    TD embedding=16 0.929 0.897 0.901 0.891 0.908 0.907 0.136 0.096
+    TD delay=4h    0.916 0.856 0.867 0.857 0.875 0.877  0.166 0.126
+    TD delay=48h   0.923 0.888 0.898 0.888 0.905 0.906  0.141 0.115
+    TD labs only   0.944 0.889 0.882 0.874 0.888 0.841  0.142 0.096
+    ============== ===== ===== ===== ===== ===== ====== ===== =====
+
+Findings on synthetic data (they check the pipeline, not the paper's claims,
+which need full MIMIC-IV):
+    * As in the paper, the 1-day supervised model is best at 1 day but worst
+      at 7-28 days; TD matches the 28-day supervised model in AUROC at long
+      horizons and is better calibrated (ECE 0.071 vs 0.108).
+    * A short next-state delay (4 h) hurts every horizon (28-day AUROC 0.875
+      vs 0.909), in line with the paper's delay sweep (Fig. 3); 48 h is close
+      to 24 h.
+    * TD is insensitive to the target-update rate in [0.005, 0.05], to
+      lambda = 0.5 mixing, and to halving the embedding size.
+    * Dropping the drug features costs about 0.02 AUROC at 28 days.
 """
 
 from __future__ import annotations

@@ -54,30 +54,38 @@ class _TokenBatchNorm(nn.Module):
         Returns:
             The normalised tensor, same shape as ``x``.
         """
+        norm = self.norm
         flat = x.reshape(-1, x.shape[-1])
-        keep = (
-            mask.reshape(-1)
+        weights = (
+            mask.reshape(-1, 1).to(flat.dtype)
             if mask is not None
-            else torch.ones(flat.shape[0], dtype=torch.bool, device=x.device)
+            else torch.ones_like(flat[:, :1])
         )
-        out = torch.zeros_like(flat)
-        valid = flat[keep]
-        if valid.shape[0] == 0:
-            return out.reshape(x.shape)
-        if self.training and valid.shape[0] < 2:
-            normed = F.batch_norm(
-                valid,
-                self.norm.running_mean,
-                self.norm.running_var,
-                self.norm.weight,
-                self.norm.bias,
-                training=False,
-                eps=self.norm.eps,
-            )
+        # Masked sums instead of boolean indexing: no host-device sync.
+        count = weights.sum()
+        mean = (flat * weights).sum(0) / count.clamp(min=1.0)
+        var = (((flat - mean) ** 2) * weights).sum(0) / count.clamp(min=1.0)
+        if self.training:
+            # A single vector has no batch statistics: use the running ones.
+            use_batch = count >= 2
+            with torch.no_grad():
+                unbiased = var * count / (count - 1).clamp(min=1.0)
+                momentum = norm.momentum
+                new_mean = (1 - momentum) * norm.running_mean + momentum * mean
+                new_var = (1 - momentum) * norm.running_var + momentum * unbiased
+                norm.running_mean.copy_(
+                    torch.where(use_batch, new_mean, norm.running_mean)
+                )
+                norm.running_var.copy_(
+                    torch.where(use_batch, new_var, norm.running_var)
+                )
+                norm.num_batches_tracked.add_(1)
+            mean = torch.where(use_batch, mean, norm.running_mean)
+            var = torch.where(use_batch, var, norm.running_var)
         else:
-            normed = self.norm(valid)
-        out[keep] = normed
-        return out.reshape(x.shape)
+            mean, var = norm.running_mean, norm.running_var
+        out = (flat - mean) * torch.rsqrt(var + norm.eps) * norm.weight + norm.bias
+        return (out * weights).reshape(x.shape)
 
 
 class TDCNNLSTMEncoder(nn.Module):

@@ -123,18 +123,39 @@ class TestTDCNNLSTM(unittest.TestCase):
         self.assertTrue(torch.all((target >= 0) & (target <= 1)))
 
     def test_td_loss_matches_manual_computation(self):
+        # Deterministic target network (eval mode) so the target can be recomputed.
         model = self._model(target_network_train_mode=False)
-        model.eval()
+        model.train()
         batch = _batch(self.dataset)
-        out = model(**batch)
+        out = model(**batch)  # first step: no soft update owed yet
         target = model.td_target(batch).reshape(-1, 1)
         expected = F.binary_cross_entropy_with_logits(out["logit"], target)
         torch.testing.assert_close(out["loss"], expected)
 
     def test_td_lambda_one_is_supervised(self):
         model = self._model(td_lambda=1.0)
-        model.eval()
+        model.train()
         out = model(**_batch(self.dataset))
+        expected = F.binary_cross_entropy_with_logits(out["logit"], out["y_true"])
+        torch.testing.assert_close(out["loss"], expected)
+
+    def test_target_network_mode_follows_flag(self):
+        model = self._model(target_network_train_mode=False)
+        model.train()
+        self.assertTrue(model.encoder.training)
+        self.assertFalse(model.target_encoder.training)
+        default = self._model()
+        default.eval()
+        self.assertTrue(default.target_encoder.training)  # authors' setting
+
+    def test_eval_does_not_touch_target_network(self):
+        model = self._model()
+        model.eval()
+        before = {k: v.clone() for k, v in model.target_encoder.state_dict().items()}
+        with torch.no_grad():
+            out = model(**_batch(self.dataset))
+        for key, value in model.target_encoder.state_dict().items():
+            torch.testing.assert_close(value, before[key])
         expected = F.binary_cross_entropy_with_logits(out["logit"], out["y_true"])
         torch.testing.assert_close(out["loss"], expected)
 
@@ -202,6 +223,20 @@ class TestTDCNNLSTM(unittest.TestCase):
         self.assertTrue(mask.all())
         high = (model.value_high[1] - model.value_mean[1]) / model.value_std[1]
         self.assertAlmostEqual(values[0, 0].item(), high.item(), places=4)
+        # Ids without statistics use the bounded fallback sign(x) * log1p(|x|).
+        self.assertAlmostEqual(values[0, 1].item(), math.log1p(1.0), places=5)
+
+    def test_delta_value_uses_clipped_values(self):
+        model = self._model()
+        self.assertEqual(model.has_delta_stats[1].item(), 1.0)
+        # An outlier value of 1000 whose previous value was a normal 5.0.
+        x = torch.tensor([[[1.0, 0.0, 1000.0, 30.0, 995.0]]])
+        _, _, _, _, delta_values, _ = model.standardize(x)
+        low, high = model.value_low[1], model.value_high[1]
+        clean = high - torch.clamp(torch.tensor(5.0), low, high)
+        expected = (clean - model.delta_value_mean[1]) / model.delta_value_std[1]
+        self.assertAlmostEqual(delta_values[0, 0].item(), expected.item(), places=3)
+        self.assertLess(abs(delta_values[0, 0].item()), 1e3)
 
     def test_paper_optimizer_params(self):
         model = self._model()

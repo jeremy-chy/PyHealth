@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 from typing import Any, Dict, Optional, Tuple
 
@@ -21,6 +22,8 @@ from torch.nn.utils.rnn import pack_padded_sequence
 
 from ..datasets import SampleDataset
 from .base_model import BaseModel
+
+logger = logging.getLogger(__name__)
 
 # Column layout of a measurement tuple, as produced by
 # :class:`~pyhealth.tasks.RealTimeICUMortalityMIMIC4`.
@@ -303,9 +306,14 @@ class TDCNNLSTM(BaseModel):
         horizons_key: Field holding the multi-horizon labels. Defaults to
             ``"mortality_horizons"``.
         normalization_samples: Number of samples used to compute the
-            statistics. Defaults to 5000.
+            statistics, or ``None`` for all samples. Defaults to 20000.
+            Feature ids (or deltas) never seen in these samples fall back to
+            the bounded transform ``sign(x) * log1p(|x|)``, and a warning is
+            logged.
         clip_quantiles: Per-feature value quantiles used for clipping.
-            Defaults to ``(0.001, 0.999)``.
+            Delta values are recomputed from the clipped current and previous
+            values, so outliers do not leak into them. Defaults to
+            ``(0.001, 0.999)``.
         seed: Seed for choosing the statistics sample. Defaults to 0.
 
     Examples:
@@ -350,7 +358,7 @@ class TDCNNLSTM(BaseModel):
         terminal_reward_key: str = "terminal_reward",
         label_horizon_index: Optional[int] = None,
         horizons_key: str = "mortality_horizons",
-        normalization_samples: int = 5000,
+        normalization_samples: Optional[int] = 20000,
         clip_quantiles: Tuple[float, float] = (0.001, 0.999),
         seed: int = 0,
     ) -> None:
@@ -407,7 +415,7 @@ class TDCNNLSTM(BaseModel):
     def _collect_statistics(
         self,
         dataset: SampleDataset,
-        max_samples: int,
+        max_samples: Optional[int],
         clip_quantiles: Tuple[float, float],
         seed: int,
     ) -> Tuple[Dict[str, np.ndarray], np.ndarray, int]:
@@ -415,7 +423,7 @@ class TDCNNLSTM(BaseModel):
 
         Args:
             dataset: Dataset whose samples hold ``measurements_key``.
-            max_samples: Maximum number of samples to read.
+            max_samples: Maximum number of samples to read (``None``: all).
             clip_quantiles: Lower and upper per-feature value quantiles.
             seed: Seed for choosing the samples.
 
@@ -426,7 +434,8 @@ class TDCNNLSTM(BaseModel):
         """
         n = len(dataset) if dataset is not None else 0
         rng = np.random.default_rng(seed)
-        picked = rng.choice(n, size=min(n, max_samples), replace=False) if n else []
+        size_ = n if max_samples is None else min(n, max_samples)
+        picked = rng.choice(n, size=size_, replace=False) if n else []
         rows, labels = [], []
         for i in picked:
             sample = dataset[int(i)]
@@ -453,6 +462,8 @@ class TDCNNLSTM(BaseModel):
             "delta_value_std": np.ones(size),
             "time_mean": np.zeros(1),
             "time_std": np.ones(1),
+            "has_value_stats": np.zeros(size),
+            "has_delta_stats": np.zeros(size),
         }
         if len(data):
             stats["time_mean"][0] = data[:, TIME].mean()
@@ -465,33 +476,52 @@ class TDCNNLSTM(BaseModel):
                 stats["value_low"][f], stats["value_high"][f] = low, high
                 stats["value_mean"][f] = clipped.mean()
                 stats["value_std"][f] = clipped.std() or 1.0
-                for col, name in (
-                    (DELTA_TIME, "delta_time"),
-                    (DELTA_VALUE, "delta_value"),
-                ):
-                    deltas = rows_f[:, col]
-                    deltas = deltas[np.isfinite(deltas)]
-                    if deltas.size:
-                        stats[f"{name}_mean"][f] = deltas.mean()
-                        stats[f"{name}_std"][f] = deltas.std() or 1.0
+                stats["has_value_stats"][f] = 1.0
+                finite = np.isfinite(rows_f[:, DELTA_TIME]) & np.isfinite(
+                    rows_f[:, DELTA_VALUE]
+                )
+                if finite.any():
+                    rows_d = rows_f[finite]
+                    # Deltas between clipped values: "clean, then difference".
+                    previous = np.clip(
+                        rows_d[:, VALUE] - rows_d[:, DELTA_VALUE], low, high
+                    )
+                    delta_v = np.clip(rows_d[:, VALUE], low, high) - previous
+                    delta_t = rows_d[:, DELTA_TIME]
+                    stats["delta_value_mean"][f] = delta_v.mean()
+                    stats["delta_value_std"][f] = delta_v.std() or 1.0
+                    stats["delta_time_mean"][f] = delta_t.mean()
+                    stats["delta_time_std"][f] = delta_t.std() or 1.0
+                    stats["has_delta_stats"][f] = 1.0
         return stats, np.asarray(labels), max_id
 
     def _register_statistics(self, stats: Dict[str, np.ndarray]) -> None:
         """Registers the statistics as buffers sized ``num_features + 2``.
 
-        Feature ids without statistics (e.g. unseen in the sample) get the
-        identity transform: no clipping, mean 0 and standard deviation 1.
+        Feature ids without statistics (e.g. unseen in the sample) are marked
+        in ``has_value_stats`` / ``has_delta_stats`` and use the bounded
+        fallback transform in :meth:`standardize`.
         """
         size = self.num_features + 2
         defaults = {"value_low": -np.inf, "value_high": np.inf}
         for name, array in stats.items():
             if not name.startswith("time_"):
                 default = defaults.get(name, 1.0 if name.endswith("std") else 0.0)
+                if name.startswith("has_"):
+                    default = 0.0
                 full = np.full(size, default, dtype=np.float64)
                 n = min(size, array.shape[0])
                 full[:n] = array[:n]
                 array = full
             self.register_buffer(name, torch.tensor(array, dtype=torch.float32))
+        missing = int((self.has_value_stats[1 : self.num_features + 1] == 0).sum())
+        if missing:
+            logger.warning(
+                "TDCNNLSTM: %d of %d feature ids have no normalisation statistics "
+                "(not in the statistics sample); they use sign(x)*log1p(|x|).",
+                missing,
+                self.num_features,
+            )
 
     @staticmethod
     def _class_weights(labels: np.ndarray) -> torch.Tensor:
@@ -522,31 +552,54 @@ class TDCNNLSTM(BaseModel):
         ids = torch.where(ids > self.num_features, torch.full_like(ids, unknown), ids)
         ids = ids.clamp(min=0)
         mask = ids > 0
-        values = torch.maximum(
-            torch.minimum(x[..., VALUE], self.value_high[ids]), self.value_low[ids]
+        low, high = self.value_low[ids], self.value_high[ids]
+        raw_values, raw_deltas = x[..., VALUE], x[..., DELTA_VALUE]
+        clipped = torch.maximum(torch.minimum(raw_values, high), low)
+        # Recompute the delta from clipped values so outliers cannot leak into it.
+        previous = torch.maximum(torch.minimum(raw_values - raw_deltas, high), low)
+        has_value = self.has_value_stats[ids] > 0
+        has_delta = self.has_delta_stats[ids] > 0
+        values = torch.where(
+            has_value,
+            (clipped - self.value_mean[ids]) / self.value_std[ids],
+            self._fallback(raw_values),
         )
-        values = (values - self.value_mean[ids]) / self.value_std[ids]
         times = (x[..., TIME] - self.time_mean) / self.time_std
-        delta_times = (
-            x[..., DELTA_TIME] - self.delta_time_mean[ids]
-        ) / self.delta_time_std[ids]
-        delta_values = (
-            x[..., DELTA_VALUE] - self.delta_value_mean[ids]
-        ) / self.delta_value_std[ids]
+        delta_times = torch.where(
+            has_delta,
+            (x[..., DELTA_TIME] - self.delta_time_mean[ids]) / self.delta_time_std[ids],
+            self._fallback(x[..., DELTA_TIME]),
+        )
+        delta_values = torch.where(
+            has_delta,
+            (clipped - previous - self.delta_value_mean[ids])
+            / self.delta_value_std[ids],
+            self._fallback(raw_deltas),
+        )
         values = torch.where(
             mask, torch.nan_to_num(values, nan=0.0), torch.zeros_like(values)
         )
         times = torch.where(mask, times, torch.zeros_like(times))
         return ids, times, values, delta_times, delta_values, mask
 
+    @staticmethod
+    def _fallback(x: torch.Tensor) -> torch.Tensor:
+        """Bounded transform for inputs without statistics (NaN preserved)."""
+        return torch.sign(x) * torch.log1p(torch.abs(x))
+
     # ------------------------------------------------------------------
     # Target network
     # ------------------------------------------------------------------
     def train(self, mode: bool = True) -> "TDCNNLSTM":
-        """Sets the training mode, keeping the target network as configured."""
+        """Sets the mode; the target network keeps its configured mode.
+
+        With ``target_network_train_mode`` the target network always runs in
+        training mode (dropout and batch statistics), as in the authors'
+        code; otherwise it always runs in evaluation mode.
+        """
         super().train(mode)
-        if self.target_encoder is not None and self.target_network_train_mode:
-            self.target_encoder.train()
+        if self.target_encoder is not None:
+            self.target_encoder.train(self.target_network_train_mode)
         return self
 
     @torch.no_grad()
@@ -578,7 +631,10 @@ class TDCNNLSTM(BaseModel):
 
         Returns:
             A dict with ``loss``, ``y_prob``, ``y_true`` and ``logit`` (all
-            ``(B, 1)`` except the scalar loss), plus pass-through fields.
+            ``(B, 1)`` except the scalar loss), plus pass-through fields. In
+            evaluation mode a TD model reports the binary cross-entropy against
+            the label as ``loss`` (the target network is only used for
+            training).
         """
         if (
             self.training
@@ -599,11 +655,15 @@ class TDCNNLSTM(BaseModel):
         else:
             y_true = kwargs[self.label_key].to(self.device).float().reshape(-1, 1)
 
-        if self.training_target == "td":
+        if self.training_target == "td" and self.training:
             target = self.td_target(kwargs).reshape(-1, 1)
             if self.td_lambda > 0:
                 target = self.td_lambda * y_true + (1.0 - self.td_lambda) * target
             loss = F.binary_cross_entropy_with_logits(logit, target)
+        elif self.training_target == "td":
+            # Evaluation: the TD target network is not run (it would cost a second
+            # pass and touch its batch-norm buffers); report BCE on the label.
+            loss = F.binary_cross_entropy_with_logits(logit, y_true)
         else:
             weights = None
             if self.class_balanced:

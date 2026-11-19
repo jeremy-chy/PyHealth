@@ -14,7 +14,7 @@ import bisect
 import math
 import random
 from datetime import datetime, timedelta
-from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import polars as pl
@@ -762,7 +762,41 @@ class RealTimeICUMortalityMIMIC4(BaseTask):
         if not events:
             return []
         events.sort(key=lambda e: (e[0], e[1]))
+        death = self._death_time(patient, events[-1][0])
 
+        def age_at(when: datetime) -> float:
+            return when.year - anchor_year + anchor_age
+
+        return self._timeline_samples(
+            patient.patient_id, events, weights, death, gender, age_at
+        )
+
+    def _timeline_samples(
+        self,
+        patient_id: str,
+        events: List[Tuple[datetime, str, float, int]],
+        weights: List[Tuple[datetime, float]],
+        death: Optional[datetime],
+        gender: float,
+        age_at: Callable[[datetime], float],
+        rng_key: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Builds the samples of one patient timeline (dataset-independent).
+
+        Args:
+            patient_id: Patient identifier stored in every sample.
+            events: ``(time, feature, value, kind)`` events sorted by time.
+            weights: ``(time, weight_kg)`` observations.
+            death: Time of death, or ``None``.
+            gender: 1.0 for female, 0.0 otherwise.
+            age_at: Function returning the age at a given time.
+            rng_key: Key of the subsampling RNG. Defaults to ``patient_id``.
+
+        Returns:
+            One sample dictionary per (subsampled) state marker.
+        """
+        if not events:
+            return []
         epoch = events[0][0]
         times = np.array(
             [(e[0] - epoch).total_seconds() / _MINUTE for e in events], dtype=np.float64
@@ -781,12 +815,11 @@ class RealTimeICUMortalityMIMIC4(BaseTask):
         # State markers: unique event times; each maps to its last event index.
         marker_times = np.unique(times)
         marker_last = np.searchsorted(times, marker_times, "right") - 1
-        death = self._death_time(patient, events[-1][0])
-        weights.sort(key=lambda w: w[0])
+        weights = sorted(weights, key=lambda w: w[0])
         weight_times = [w[0] for w in weights]
 
         def demographics_at(when: datetime) -> List[float]:
-            age = when.year - anchor_year + anchor_age
+            age = age_at(when)
             pos = bisect.bisect_right(weight_times, when) - 1
             weight = (
                 weights[pos][1] if pos >= 0 else self.DEFAULT_WEIGHT_KG[int(gender)]
@@ -798,7 +831,7 @@ class RealTimeICUMortalityMIMIC4(BaseTask):
 
         delay = self.next_state_delay_hours * 60.0
         window = self.next_state_window_hours * 60.0
-        rng = random.Random(f"{self.seed}-{patient.patient_id}")
+        rng = random.Random(f"{self.seed}-{rng_key or patient_id}")
         chosen = [
             k
             for k in range(len(marker_times))
@@ -841,7 +874,7 @@ class RealTimeICUMortalityMIMIC4(BaseTask):
             next_obs = obs if terminal else observation_at(lo)[0]
             samples.append(
                 {
-                    "patient_id": patient.patient_id,
+                    "patient_id": patient_id,
                     "measurements": obs,
                     "next_measurements": next_obs,
                     "terminal": float(terminal),

@@ -219,6 +219,7 @@ Available Tasks
     In-Hospital Mortality (MIMIC-IV) <tasks/pyhealth.tasks.InHospitalMortalityMIMIC4>
     In-Hospital Mortality (MEDS) <tasks/pyhealth.tasks.InHospitalMortalityMEDS>
     Real-Time ICU Mortality with Next States (MIMIC-IV) <tasks/pyhealth.tasks.RealTimeICUMortalityMIMIC4>
+    Real-Time ICU Mortality with Next States (eICU) <tasks/pyhealth.tasks.RealTimeICUMortalityEICU>
     ICU Admission (MEDS) <tasks/pyhealth.tasks.ICUAdmissionMEDS>
     Hospital Readmission (MEDS) <tasks/pyhealth.tasks.HospitalReadmissionMEDS>
     Prolonged Length of Stay (MEDS) <tasks/pyhealth.tasks.ProlongedLengthOfStayMEDS>
